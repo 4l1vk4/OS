@@ -7,7 +7,6 @@ except OSError:
     print("Ошибка загрузки библиотеки")
     sys.exit(1)
 
-# Указываем типы аргументов
 lib.caesar_key.argtypes = [ctypes.c_ubyte]
 lib.caesar_key.restype = None
 
