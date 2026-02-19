@@ -11,7 +11,7 @@ $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(TARGET) $(SRC)
 
 install: $(TARGET)
-	sudo cp $(TARGET) /test
+	sudo cp $(TARGET) /usr/local/lib
 	sudo ldconfig
 
 test: $(TARGET)
