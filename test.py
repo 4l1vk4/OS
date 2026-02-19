@@ -17,24 +17,17 @@ lib.caesar.argtypes = [
 ]
 lib.caesar.restype = None
 
-
-# Исходные данные
 data = b"hello world"
 length = len(data)
 
-# Создаём буфер для результата
 src = ctypes.create_string_buffer(data)
 dst = ctypes.create_string_buffer(length)
 
-# Устанавливаем ключ
 lib.caesar_key(3)
-
-# Шифруем
 lib.caesar(src, dst, length)
 
 print("Encrypted:", bytes(dst.raw))
 
-# Дешифруем обратно
 decrypted = ctypes.create_string_buffer(length)
 lib.caesar(dst, decrypted, length)
 
