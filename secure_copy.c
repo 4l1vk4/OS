@@ -1,180 +1,219 @@
+#define _POSIX_C_SOURCE 200112L
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include "libcaesar.h"
 
+#ifdef __APPLE__
+int pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *abs_timeout) {
+    struct timespec current_time;
+    struct timespec sleep_time = {0, 5000000};
+
+    while (1) {
+        int result = pthread_mutex_trylock(mutex);
+        if (result == 0) {
+            return 0;
+        }
+        if (result != EBUSY) {
+            return result;
+        }
+
+        clock_gettime(CLOCK_REALTIME, &current_time);
+        if (current_time.tv_sec > abs_timeout->tv_sec ||
+           (current_time.tv_sec == abs_timeout->tv_sec && current_time.tv_nsec >= abs_timeout->tv_nsec)) {
+            return ETIMEDOUT;
+        }
+
+        
+        nanosleep(&sleep_time, NULL);
+    }
+}
+#endif
+
 #define BUFFER_SIZE 4096
+#define NUM_THREADS 3
 
 volatile int keep_running = 1;
 
 typedef struct {
-    unsigned char data[BUFFER_SIZE];
-    int bytes_in_buffer;
-    int is_eof; 
+    char **filenames;       
+    int total_files;        
+    int current_index;      
     
-    pthread_mutex_t mutex;
-    pthread_cond_t cond_full; 
-    pthread_cond_t cond_empty; 
+    int copied_files_count; 
     
-    FILE *in;
-    FILE *out;
-    long total_size;
-    long processed_bytes;
-} thread_data_t;
+    char *out_dir;          
+    FILE *log_file;         
+    
+    pthread_mutex_t mutex;  
+} thread_pool_t;
 
 void handle_sigint(int sig) {
     (void)sig; 
     keep_running = 0;
 }
 
-void* producer_thread(void* arg) {
-    thread_data_t *ctx = (thread_data_t*)arg;
-    
-    while (keep_running) {
-        pthread_mutex_lock(&ctx->mutex);
-        
-        while (ctx->bytes_in_buffer > 0 && keep_running) {
-            pthread_cond_wait(&ctx->cond_empty, &ctx->mutex);
-        }
-
-        if (!keep_running) {
-            pthread_cond_broadcast(&ctx->cond_full); 
-            pthread_mutex_unlock(&ctx->mutex);
-            break;
-        }
-
-        int read_bytes = fread(ctx->data, 1, BUFFER_SIZE, ctx->in);
-        if (read_bytes > 0) {
-            caesar(ctx->data, ctx->data, read_bytes);
-            ctx->bytes_in_buffer = read_bytes;
-            ctx->processed_bytes += read_bytes;
-        } else {
-            ctx->is_eof = 1;
-        }
-
-        pthread_cond_signal(&ctx->cond_full); 
-        pthread_mutex_unlock(&ctx->mutex);
-
-        if (ctx->is_eof) break;
-    }
-    return NULL;
+const char* get_basename(const char* path) {
+    const char *base = strrchr(path, '/');
+    return base ? base + 1 : path;
 }
 
-void* consumer_thread(void* arg) {
-    thread_data_t *ctx = (thread_data_t*)arg;
-    int last_percent = -1;
-    struct timeval last_time = {0, 0};
+void* worker_thread(void* arg) {
+    thread_pool_t *ctx = (thread_pool_t*)arg;
+    unsigned char buffer[BUFFER_SIZE];
+    unsigned long tid = (unsigned long)pthread_self();
 
     while (keep_running) {
-        pthread_mutex_lock(&ctx->mutex);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5;
 
-        while (ctx->bytes_in_buffer == 0 && !ctx->is_eof && keep_running) {
-            pthread_cond_wait(&ctx->cond_full, &ctx->mutex);
+        int lock_err = pthread_mutex_timedlock(&ctx->mutex, &ts);
+        if (lock_err != 0) {
+            if (lock_err == ETIMEDOUT) {
+                fprintf(stderr, "Возможная взаимоблокировка: поток %lu ожидает мьютекс более 5 секунд\n", tid);
+            }
+            continue;
         }
 
-        if (!keep_running && ctx->bytes_in_buffer == 0) {
-            pthread_cond_broadcast(&ctx->cond_empty); 
+        if (ctx->current_index >= ctx->total_files) {
             pthread_mutex_unlock(&ctx->mutex);
             break;
         }
 
-        if (ctx->bytes_in_buffer > 0) {
-            fwrite(ctx->data, 1, ctx->bytes_in_buffer, ctx->out);
-            ctx->bytes_in_buffer = 0;
-        }
-
-        int percent = (ctx->total_size > 0) ? (int)((ctx->processed_bytes * 100) / ctx->total_size) : 100;
-        
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        long elapsed_ms = (now.tv_sec - last_time.tv_sec) * 1000 + (now.tv_usec - last_time.tv_usec) / 1000;
-
-        if (percent % 10 == 0 && percent != last_percent && elapsed_ms >= 100) {
-            printf("\rProgress: [");
-            for(int i = 0; i < percent / 10; i++) printf("=");
-            for(int i = percent / 10; i < 10; i++) printf(" ");
-            printf("] %d%%", percent);
-            fflush(stdout);
-            
-            last_percent = percent;
-            last_time = now;
-        }
-
-        int finish = ctx->is_eof;
-        pthread_cond_signal(&ctx->cond_empty); 
+        int my_index = ctx->current_index++;
+        char *src_path = ctx->filenames[my_index];
         pthread_mutex_unlock(&ctx->mutex);
 
-        if (finish) break;
-    }
-    
-    if (ctx->is_eof && keep_running) {
-        printf("\rProgress: [==========] 100%%\n");
+        char dest_path[2048];
+        snprintf(dest_path, sizeof(dest_path), "%s/%s", ctx->out_dir, get_basename(src_path));
+
+        struct timeval start, end;
+        gettimeofday(&start, NULL);
+
+        int success = 1;
+        FILE *in = fopen(src_path, "rb");
+        FILE *out = NULL;
+        
+        if (!in) {
+            success = 0;
+        } else {
+            out = fopen(dest_path, "wb");
+            if (!out) {
+                success = 0;
+                fclose(in);
+            }
+        }
+
+        if (success) {
+            size_t bytes_read;
+            while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, in)) > 0 && keep_running) {
+                caesar(buffer, buffer, bytes_read);
+                if (fwrite(buffer, 1, bytes_read, out) != bytes_read) {
+                    success = 0;
+                    break;
+                }
+            }
+            fclose(in);
+            fclose(out);
+        }
+
+        if (!keep_running) break;
+
+        gettimeofday(&end, NULL);
+        double elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0;
+        time_t rawtime;
+        struct tm *timeinfo;
+        char time_str[80];
+        time(&rawtime);
+        timeinfo = localtime(&rawtime);
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
+
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5;
+        lock_err = pthread_mutex_timedlock(&ctx->mutex, &ts);
+        
+        if (lock_err == 0) {
+            if (success) {
+                ctx->copied_files_count++;
+            }
+            
+            fprintf(ctx->log_file, "[%s] Thread ID: %lu | Файл: %s | Результат: %s | Время: %.3f сек\n", 
+                    time_str, tid, src_path, success ? "Успех" : "Ошибка", elapsed_time);
+            fflush(ctx->log_file);
+            
+            pthread_mutex_unlock(&ctx->mutex);
+        } else if (lock_err == ETIMEDOUT) {
+            fprintf(stderr, "Возможная взаимоблокировка: поток %lu ожидает мьютекс записи лога более 5 секунд\n", tid);
+        }
     }
     
     return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        printf("Usage: %s <source> <dest> <key>\n", argv[0]);
+    if (argc < 4) {
+        printf("Использование: %s <file1> [file2 ...] <output_dir> <key>\n", argv[0]);
         return 1;
     }
 
     signal(SIGINT, handle_sigint);
 
-    caesar_key((unsigned char)atoi(argv[3]));
-
-    FILE *in = fopen(argv[1], "rb");
-    if (!in) { 
-        perror("Source file error"); 
-        return 1; 
-    }
+    int num_files = argc - 3;
+    char *out_dir = argv[argc - 2];
+    unsigned char key = (unsigned char)atoi(argv[argc - 1]);
     
-    FILE *out = fopen(argv[2], "wb");
-    if (!out) { 
-        perror("Dest file error"); 
-        fclose(in);
-        return 1; 
+    caesar_key(key);
+
+    struct stat st = {0};
+    if (stat(out_dir, &st) == -1) {
+        if (mkdir(out_dir, 0777) == -1) {
+            perror("Ошибка создания выходной директории");
+            return 1;
+        }
     }
 
-    fseek(in, 0, SEEK_END);
-    long size = ftell(in);
-    rewind(in);
+    FILE *log_file = fopen("log.txt", "a");
+    if (!log_file) {
+        perror("Ошибка открытия лога");
+        return 1;
+    }
 
-    thread_data_t ctx = { 
-        .in = in, 
-        .out = out, 
-        .total_size = size, 
-        .processed_bytes = 0, 
-        .bytes_in_buffer = 0, 
-        .is_eof = 0 
-    };
+    thread_pool_t ctx;
+    ctx.filenames = &argv[1];
+    ctx.total_files = num_files;
+    ctx.current_index = 0;
+    ctx.copied_files_count = 0;
+    ctx.out_dir = out_dir;
+    ctx.log_file = log_file;
     
     pthread_mutex_init(&ctx.mutex, NULL);
-    pthread_cond_init(&ctx.cond_full, NULL);
-    pthread_cond_init(&ctx.cond_empty, NULL);
 
-    pthread_t prod, cons;
-    pthread_create(&prod, NULL, producer_thread, &ctx);
-    pthread_create(&cons, NULL, consumer_thread, &ctx);
-
-    pthread_join(prod, NULL);
-    pthread_join(cons, NULL);
-
-    fclose(in);
-    fclose(out);
-    pthread_mutex_destroy(&ctx.mutex);
-    pthread_cond_destroy(&ctx.cond_full);
-    pthread_cond_destroy(&ctx.cond_empty);
-
-    if (!keep_running) {
-        printf("\nОперация прервана пользователем\n");
-    } else {
-        printf("Готово!\n");
+    pthread_t threads[NUM_THREADS];
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_create(&threads[i], NULL, worker_thread, &ctx);
     }
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    pthread_mutex_destroy(&ctx.mutex);
+    fclose(log_file);
+
+    if (keep_running) {
+        printf("Файлы: %d из %d\n", ctx.copied_files_count, ctx.total_files);
+    } else {
+        printf("\nОперация прервана. Успешно скопировано файлов: %d\n", ctx.copied_files_count);
+    }
+    
     return 0;
 }
