@@ -80,6 +80,7 @@ void* worker_thread(void* arg) {
         if (lock_err != 0) {
             if (lock_err == ETIMEDOUT) {
                 fprintf(stderr, "Возможная взаимоблокировка: поток %lu ожидает мьютекс более 5 секунд\n", tid);
+                exit(0);
             }
             continue;
         }
