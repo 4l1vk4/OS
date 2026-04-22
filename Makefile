@@ -19,3 +19,11 @@ test: $(TARGET)
 
 clean:
 	rm -f $(TARGET)
+compile:
+	gcc secure_copy.c -o secure_copy -pthread -lcaesar -L. -Wall -Wextra
+test_seq:
+	./secure_copy --mode=sequential f6.bin f7.bin outdir1 12
+test_par:
+	./secure_copy --mode=parallel f6.bin f7.bin outdir1 12
+test_auto:
+	./secure_copy f6.bin f7.bin outdir1 12

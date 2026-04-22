@@ -6,85 +6,79 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
-#include <sys/time.h>
-#include <sys/types.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include "libcaesar.h"
 
-#ifdef __APPLE__
-int pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *abs_timeout) {
-    struct timespec current_time;
-    struct timespec sleep_time = {0, 5000000};
-
-    while (1) {
-        int result = pthread_mutex_trylock(mutex);
-        if (result == 0) {
-            return 0;
-        }
-        if (result != EBUSY) {
-            return result;
-        }
-
-        clock_gettime(CLOCK_REALTIME, &current_time);
-        if (current_time.tv_sec > abs_timeout->tv_sec ||
-           (current_time.tv_sec == abs_timeout->tv_sec && current_time.tv_nsec >= abs_timeout->tv_nsec)) {
-            return ETIMEDOUT;
-        }
-
-        
-        nanosleep(&sleep_time, NULL);
-    }
-}
-#endif
-
 #define BUFFER_SIZE 4096
-#define NUM_THREADS 3
+#define WORKERS_COUNT 4
+
+
+#define MODE_AUTO 0
+#define MODE_SEQUENTIAL 1
+#define MODE_PARALLEL 2
 
 volatile int keep_running = 1;
+
 
 typedef struct {
     char **filenames;       
     int total_files;        
     int current_index;      
-    
-    int copied_files_count; 
-    
     char *out_dir;          
-    FILE *log_file;         
-    
     pthread_mutex_t mutex;  
 } thread_pool_t;
+
 
 void handle_sigint(int sig) {
     (void)sig; 
     keep_running = 0;
 }
 
+
 const char* get_basename(const char* path) {
     const char *base = strrchr(path, '/');
     return base ? base + 1 : path;
 }
 
+
+int process_single_file(const char *src_path, const char *out_dir) {
+    if (!keep_running) return 0;
+
+    char dest_path[2048];
+    snprintf(dest_path, sizeof(dest_path), "%s/%s", out_dir, get_basename(src_path));
+
+    FILE *in = fopen(src_path, "rb");
+    if (!in) {
+        fprintf(stderr, "Ошибка чтения: %s\n", src_path);
+        return 0;
+    }
+
+    FILE *out = fopen(dest_path, "wb");
+    if (!out) {
+        fprintf(stderr, "Ошибка записи: %s\n", dest_path);
+        fclose(in);
+        return 0;
+    }
+
+    unsigned char buffer[BUFFER_SIZE];
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, in)) > 0 && keep_running) {
+        caesar(buffer, buffer, bytes_read);
+        fwrite(buffer, 1, bytes_read, out);
+    }
+
+    fclose(in);
+    fclose(out);
+    return 1;
+}
+
 void* worker_thread(void* arg) {
     thread_pool_t *ctx = (thread_pool_t*)arg;
-    unsigned char buffer[BUFFER_SIZE];
-    unsigned long tid = (unsigned long)pthread_self();
 
     while (keep_running) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 5;
-
-        int lock_err = pthread_mutex_timedlock(&ctx->mutex, &ts);
-        if (lock_err != 0) {
-            if (lock_err == ETIMEDOUT) {
-                fprintf(stderr, "Возможная взаимоблокировка: поток %lu ожидает мьютекс более 5 секунд\n", tid);
-                exit(0);
-            }
-            continue;
-        }
-
+        pthread_mutex_lock(&ctx->mutex);
+        
         if (ctx->current_index >= ctx->total_files) {
             pthread_mutex_unlock(&ctx->mutex);
             break;
@@ -92,129 +86,117 @@ void* worker_thread(void* arg) {
 
         int my_index = ctx->current_index++;
         char *src_path = ctx->filenames[my_index];
+        
         pthread_mutex_unlock(&ctx->mutex);
 
-        char dest_path[2048];
-        snprintf(dest_path, sizeof(dest_path), "%s/%s", ctx->out_dir, get_basename(src_path));
-
-        struct timeval start, end;
-        gettimeofday(&start, NULL);
-
-        int success = 1;
-        FILE *in = fopen(src_path, "rb");
-        FILE *out = NULL;
-        
-        if (!in) {
-            success = 0;
-        } else {
-            out = fopen(dest_path, "wb");
-            if (!out) {
-                success = 0;
-                fclose(in);
-            }
-        }
-
-        if (success) {
-            size_t bytes_read;
-            while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, in)) > 0 && keep_running) {
-                caesar(buffer, buffer, bytes_read);
-                if (fwrite(buffer, 1, bytes_read, out) != bytes_read) {
-                    success = 0;
-                    break;
-                }
-            }
-            fclose(in);
-            fclose(out);
-        }
-
-        if (!keep_running) break;
-
-        gettimeofday(&end, NULL);
-        double elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0;
-        time_t rawtime;
-        struct tm *timeinfo;
-        char time_str[80];
-        time(&rawtime);
-        timeinfo = localtime(&rawtime);
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", timeinfo);
-
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 5;
-        lock_err = pthread_mutex_timedlock(&ctx->mutex, &ts);
-        
-        if (lock_err == 0) {
-            if (success) {
-                ctx->copied_files_count++;
-            }
-            
-            fprintf(ctx->log_file, "[%s] Thread ID: %lu | Файл: %s | Результат: %s | Время: %.3f сек\n", 
-                    time_str, tid, src_path, success ? "Успех" : "Ошибка", elapsed_time);
-            fflush(ctx->log_file);
-            
-            pthread_mutex_unlock(&ctx->mutex);
-        } else if (lock_err == ETIMEDOUT) {
-            fprintf(stderr, "Возможная взаимоблокировка: поток %lu ожидает мьютекс записи лога более 5 секунд\n", tid);
-        }
+        process_single_file(src_path, ctx->out_dir);
     }
     
     return NULL;
 }
 
+
+double run_mode(int mode, char **files, int num_files, const char *out_dir) {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    if (mode == MODE_SEQUENTIAL) {
+        for (int i = 0; i < num_files && keep_running; i++) {
+            process_single_file(files[i], out_dir);
+        }
+    } else if (mode == MODE_PARALLEL) {
+        thread_pool_t ctx = { files, num_files, 0, (char*)out_dir };
+        pthread_mutex_init(&ctx.mutex, NULL);
+        
+        pthread_t workers[WORKERS_COUNT];
+        int active_threads = (num_files < WORKERS_COUNT) ? num_files : WORKERS_COUNT;
+
+        for (int i = 0; i < active_threads; i++) {
+            pthread_create(&workers[i], NULL, worker_thread, &ctx);
+        }
+
+        for (int i = 0; i < active_threads; i++) {
+            pthread_join(workers[i], NULL);
+        }
+        
+        pthread_mutex_destroy(&ctx.mutex);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    return (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 4) {
-        printf("Использование: %s <file1> [file2 ...] <output_dir> <key>\n", argv[0]);
+        printf("Использование: %s [--mode=sequential|parallel] <file1> [file2...] <out_dir> <key>\n", argv[0]);
         return 1;
     }
 
     signal(SIGINT, handle_sigint);
 
-    int num_files = argc - 3;
+    int mode = MODE_AUTO;
+    int first_file_idx = 1;
+
+    if (strncmp(argv[1], "--mode=", 7) == 0) {
+        if (strcmp(argv[1], "--mode=sequential") == 0) mode = MODE_SEQUENTIAL;
+        else if (strcmp(argv[1], "--mode=parallel") == 0) mode = MODE_PARALLEL;
+        first_file_idx = 2;
+    }
+
+    int num_files = argc - first_file_idx - 2;
+    if (num_files <= 0) {
+        printf("Ошибка: не указаны входные файлы.\n");
+        return 1;
+    }
+
     char *out_dir = argv[argc - 2];
     unsigned char key = (unsigned char)atoi(argv[argc - 1]);
-    
     caesar_key(key);
 
     struct stat st = {0};
     if (stat(out_dir, &st) == -1) {
-        if (mkdir(out_dir, 0777) == -1) {
-            perror("Ошибка создания выходной директории");
-            return 1;
+        mkdir(out_dir, 0777);
+    }
+
+    if (mode == MODE_AUTO) {
+        printf("--- Режим автоматического выбора ---\n");
+        printf("Количество файлов: %d\n", num_files);
+        int optimal_mode = (num_files < 5) ? MODE_SEQUENTIAL : MODE_PARALLEL;
+        printf("Выбран %s режим.\n\n", optimal_mode == MODE_SEQUENTIAL ? "последовательный" : "параллельный");
+
+        double seq_time = run_mode(MODE_SEQUENTIAL, &argv[first_file_idx], num_files, out_dir);
+        
+        if (keep_running) {
+            double par_time = run_mode(MODE_PARALLEL, &argv[first_file_idx], num_files, out_dir);
+
+            printf("\n--- Сравнение режимов ---\n");
+            printf("\n");
+            printf("| %-18s      | %-16s | %-16s|\n", "Режим", "Общее время (мс)", "Ср. время/файл(vc)");
+            printf("|--------------------|------------------|-------------------|\n");
+            printf("| %-18s | %-16.2f | %-16.2f  |\n", "Sequential", seq_time, seq_time / num_files);
+            printf("| %-18s | %-16.2f | %-16.2f  |\n", "Parallel (4 thr)", par_time, par_time / num_files);
+            
+            if (par_time < seq_time) {
+                printf("\nВывод: Параллельный режим быстрее на %.2f мс.\n", seq_time - par_time);
+            } else {
+                printf("\nВывод: Последовательный режим быстрее на %.2f мс.\n", par_time - seq_time);
+            }
+        }
+    } else {
+        printf("Запуск в %s режиме...\n", mode == MODE_SEQUENTIAL ? "ПОСЛЕДОВАТЕЛЬНОМ" : "ПАРАЛЛЕЛЬНОМ");
+        double total_time = run_mode(mode, &argv[first_file_idx], num_files, out_dir);
+        
+        if (keep_running) {
+            printf("\n--- Статистика ---\n");
+            printf("Обработано файлов: %d\n", num_files);
+            printf("Общее время:       %.2f мс\n", total_time);
+            printf("Ср. время на файл: %.2f мс\n", total_time / num_files);
         }
     }
 
-    FILE *log_file = fopen("log.txt", "a");
-    if (!log_file) {
-        perror("Ошибка открытия лога");
-        return 1;
+    if (!keep_running) {
+        printf("\nОперация прервана пользователем!\n");
     }
 
-    thread_pool_t ctx;
-    ctx.filenames = &argv[1];
-    ctx.total_files = num_files;
-    ctx.current_index = 0;
-    ctx.copied_files_count = 0;
-    ctx.out_dir = out_dir;
-    ctx.log_file = log_file;
-    
-    pthread_mutex_init(&ctx.mutex, NULL);
-
-    pthread_t threads[NUM_THREADS];
-    for (int i = 0; i < NUM_THREADS; i++) {
-        pthread_create(&threads[i], NULL, worker_thread, &ctx);
-    }
-
-    for (int i = 0; i < NUM_THREADS; i++) {
-        pthread_join(threads[i], NULL);
-    }
-
-    pthread_mutex_destroy(&ctx.mutex);
-    fclose(log_file);
-
-    if (keep_running) {
-        printf("Файлы: %d из %d\n", ctx.copied_files_count, ctx.total_files);
-    } else {
-        printf("\nОперация прервана. Успешно скопировано файлов: %d\n", ctx.copied_files_count);
-    }
-    
     return 0;
 }
