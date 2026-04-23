@@ -12,14 +12,11 @@
 
 #define BUFFER_SIZE 4096
 #define WORKERS_COUNT 4
-
-
 #define MODE_AUTO 0
 #define MODE_SEQUENTIAL 1
 #define MODE_PARALLEL 2
 
 volatile int keep_running = 1;
-
 
 typedef struct {
     char **filenames;       
@@ -29,12 +26,10 @@ typedef struct {
     pthread_mutex_t mutex;  
 } thread_pool_t;
 
-
 void handle_sigint(int sig) {
     (void)sig; 
     keep_running = 0;
 }
-
 
 const char* get_basename(const char* path) {
     const char *base = strrchr(path, '/');
@@ -51,9 +46,8 @@ int process_single_file(const char *src_path, const char *out_dir) {
     FILE *in = fopen(src_path, "rb");
     if (!in) {
         fprintf(stderr, "Ошибка чтения: %s\n", src_path);
-        return 0;
+        return(0);
     }
-
     FILE *out = fopen(dest_path, "wb");
     if (!out) {
         fprintf(stderr, "Ошибка записи: %s\n", dest_path);
@@ -110,11 +104,9 @@ double run_mode(int mode, char **files, int num_files, const char *out_dir) {
         
         pthread_t workers[WORKERS_COUNT];
         int active_threads = (num_files < WORKERS_COUNT) ? num_files : WORKERS_COUNT;
-
         for (int i = 0; i < active_threads; i++) {
             pthread_create(&workers[i], NULL, worker_thread, &ctx);
         }
-
         for (int i = 0; i < active_threads; i++) {
             pthread_join(workers[i], NULL);
         }
@@ -129,7 +121,7 @@ double run_mode(int mode, char **files, int num_files, const char *out_dir) {
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         printf("Использование: %s [--mode=sequential|parallel] <file1> [file2...] <out_dir> <key>\n", argv[0]);
-        return 1;
+        exit(1);
     }
 
     signal(SIGINT, handle_sigint);
@@ -146,7 +138,7 @@ int main(int argc, char *argv[]) {
     int num_files = argc - first_file_idx - 2;
     if (num_files <= 0) {
         printf("Ошибка: не указаны входные файлы.\n");
-        return 1;
+        exit(1);
     }
 
     char *out_dir = argv[argc - 2];
@@ -163,7 +155,7 @@ int main(int argc, char *argv[]) {
         printf("Количество файлов: %d\n", num_files);
         int optimal_mode = (num_files < 5) ? MODE_SEQUENTIAL : MODE_PARALLEL;
         printf("Выбран %s режим.\n\n", optimal_mode == MODE_SEQUENTIAL ? "последовательный" : "параллельный");
-
+        
         double seq_time = run_mode(MODE_SEQUENTIAL, &argv[first_file_idx], num_files, out_dir);
         
         if (keep_running) {
@@ -195,7 +187,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (!keep_running) {
-        printf("\nОперация прервана пользователем!\n");
+        printf("\nОперация прервана\n");
     }
 
     return 0;
