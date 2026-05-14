@@ -1,3 +1,4 @@
 *.txt
 *.bin
 outdir/
+*.DS_Store

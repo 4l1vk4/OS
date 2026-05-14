@@ -36,7 +36,6 @@ const char* get_basename(const char* path) {
     return base ? base + 1 : path;
 }
 
-
 int process_single_file(const char *src_path, const char *out_dir) {
     if (!keep_running) return 0;
 
@@ -46,7 +45,7 @@ int process_single_file(const char *src_path, const char *out_dir) {
     FILE *in = fopen(src_path, "rb");
     if (!in) {
         fprintf(stderr, "Ошибка чтения: %s\n", src_path);
-        return(0);
+        return 0;
     }
     FILE *out = fopen(dest_path, "wb");
     if (!out) {
@@ -89,7 +88,6 @@ void* worker_thread(void* arg) {
     return NULL;
 }
 
-
 double run_mode(int mode, char **files, int num_files, const char *out_dir) {
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -120,7 +118,7 @@ double run_mode(int mode, char **files, int num_files, const char *out_dir) {
 
 int main(int argc, char *argv[]) {
     if (argc < 4) {
-        printf("Использование: %s [--mode=sequential|parallel] <file1> [file2...] <out_dir> <key>\n", argv[0]);
+        printf("Использование: %s [--mode=sequential|parallel|--test-segfault] <file1> [file2...] <out_dir> <key>\n", argv[0]);
         exit(1);
     }
 
@@ -128,27 +126,37 @@ int main(int argc, char *argv[]) {
 
     int mode = MODE_AUTO;
     int first_file_idx = 1;
+    int test_attack = 0;
 
-    if (strncmp(argv[1], "--mode=", 7) == 0) {
+    if (strncmp(argv[1], "--", 2) == 0) {
         if (strcmp(argv[1], "--mode=sequential") == 0) mode = MODE_SEQUENTIAL;
         else if (strcmp(argv[1], "--mode=parallel") == 0) mode = MODE_PARALLEL;
+        else if (strcmp(argv[1], "--test-segfault") == 0) test_attack = 1;
         first_file_idx = 2;
     }
 
-    int num_files = argc - first_file_idx - 2;
-    if (num_files <= 0) {
+    int total_args_for_files = argc - first_file_idx - 2;
+    if (total_args_for_files <= 0 && !test_attack) {
         printf("Ошибка: не указаны входные файлы.\n");
         exit(1);
     }
 
     char *out_dir = argv[argc - 2];
     unsigned char key = (unsigned char)atoi(argv[argc - 1]);
+    
     caesar_key(key);
+
+    if (test_attack) {
+        trigger_security_violation();
+        return 0;
+    }
 
     struct stat st = {0};
     if (stat(out_dir, &st) == -1) {
         mkdir(out_dir, 0777);
     }
+
+    int num_files = total_args_for_files;
 
     if (mode == MODE_AUTO) {
         printf("--- Режим автоматического выбора ---\n");
