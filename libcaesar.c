@@ -13,7 +13,7 @@ static size_t page_size = 16;
 void memory_violation_handler(int sig, siginfo_t *si, void *unused) {
     (void)unused;
     if (si->si_addr >= (void*)secure_key_ptr && si->si_addr < (void*)(secure_key_ptr + page_size)) {
-        fprintf(stderr, "\n[%s] Error: unauthorized try to write\n", sig == SIGBUS ? "SIGBUS" : "SIGSEGV");
+        fprintf(stderr, "\n[%s] Попытка несанкционированной записи в защищенную память ключа!\n", sig == SIGBUS ? "SIGBUS" : "SIGSEGV");
         exit(1); 
     }
     
@@ -40,9 +40,11 @@ void caesar_key(unsigned char key)
         sa.sa_sigaction = memory_violation_handler;
         
         if (sigaction(SIGSEGV, &sa, NULL) == -1) {
+            perror("Ошибка sigaction SIGSEGV");
             exit(1);
         }
         if (sigaction(SIGBUS, &sa, NULL) == -1) {
+            perror("Ошибка sigaction SIGBUS");
             exit(1);
         }
     }
@@ -70,25 +72,23 @@ void caesar(void* src, void* dst, int len)
         exit(1);
     }
 
-    unsigned char local_key = secure_key_ptr[0];
-
-    if (mprotect(secure_key_ptr, page_size, PROT_READ) == -1) {
-        perror("Ошибка mprotect (temp lock)");
-        exit(1);
-    }
-
     unsigned char* s = (unsigned char*)src;
     unsigned char* d = (unsigned char*)dst;
 
     for (int i = 0; i < len; i++)
     {
-        d[i] = s[i] ^ local_key;
+        d[i] = s[i] ^ secure_key_ptr[0];
+    }
+
+    if (mprotect(secure_key_ptr, page_size, PROT_READ) == -1) {
+        perror("Ошибка mprotect (temp lock)");
+        exit(1);
     }
 }
 
 void trigger_security_violation() {
     if (secure_key_ptr) {
-        printf("\n Attacking... \n");
+        printf("\n--- Попытка прямой записи в память ключа ---\n");
         secure_key_ptr[0] = 0x99;
     }
 }
