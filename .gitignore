@@ -2,3 +2,4 @@
 *.bin
 outdir/
 *.DS_Store
+*.img
