@@ -22,7 +22,7 @@ rc4_ctx_t* rc4_init(const unsigned char *key, int key_len) {
     
     ctx->page_size = sysconf(_SC_PAGESIZE);
     ctx->state = mmap(NULL, ctx->page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    
+
     if (ctx->state == MAP_FAILED) {
         free(ctx);
         return NULL;
@@ -54,7 +54,7 @@ rc4_ctx_t* rc4_init(const unsigned char *key, int key_len) {
     ctx->i = 0;
     ctx->j = 0;
 
-    mprotect(ctx->state, ctx->page_size, PROT_READ);
+    mprotect(ctx->state, ctx->page_size, PROT_NONE);
     return ctx;
 }
 
@@ -77,7 +77,7 @@ void rc4_crypt(rc4_ctx_t *ctx, unsigned char *data, int data_len) {
         data[k] ^= ctx->state[t];
     }
 
-    mprotect(ctx->state, ctx->page_size, PROT_READ);
+    mprotect(ctx->state, ctx->page_size, PROT_NONE);
 }
 
 void rc4_cleanup(rc4_ctx_t *ctx) {

@@ -17,7 +17,7 @@
 #define BUFFER_SIZE 4096
 #define CAESAR_WORKERS_COUNT 4
 #define CONTAINER_WORKERS_COUNT 5
-#define MAX_DEPTH 6
+#define MAX_DEPTH 4
 
 #define MODE_AUTO 0
 #define MODE_SEQUENTIAL 1
@@ -43,10 +43,10 @@ typedef struct {
     char **filenames;
     int total_files;
     int current_index;
-    const char *container_path;
+    int fd;                  
+    off_t *offsets;          
     const char *master_key;
     pthread_mutex_t task_mutex;
-    pthread_mutex_t write_mutex;
 } container_pool_t;
 
 typedef struct {
@@ -108,10 +108,11 @@ void generate_salt(unsigned char *salt, size_t length) {
     }
 }
 
-void process_container_file(const char *src_file, const char *container_path, const char *master_key, pthread_mutex_t *write_mutex) {
+void process_container_file(const char *src_file, int fd, off_t start_offset, const char *master_key) {
     if (!keep_running) return;
     FILE *in = fopen(src_file, "rb");
     if (!in) return;
+    
     fseek(in, 0, SEEK_END);
     uint32_t file_size = ftell(in);
     rewind(in);
@@ -128,29 +129,34 @@ void process_container_file(const char *src_file, const char *container_path, co
     memcpy(derived_key, master_key, key_len);
     memcpy(derived_key + key_len, header.salt, 16);
 
-    unsigned char *encrypted_data = malloc(file_size + 1);
-    if (!encrypted_data && file_size > 0) { free(derived_key); fclose(in); return; }
+    size_t header_total_size = sizeof(uint32_t) * 2 + 16 + name_size;
+    unsigned char *header_buf = malloc(header_total_size);
+    if (header_buf) {
+        uint32_t offset = 0;
+        memcpy(header_buf + offset, &header.file_size, sizeof(uint32_t)); offset += sizeof(uint32_t);
+        memcpy(header_buf + offset, &header.name_size, sizeof(uint32_t)); offset += sizeof(uint32_t);
+        memcpy(header_buf + offset, header.salt, 16); offset += 16;
+        memcpy(header_buf + offset, src_file, name_size);
+        
+        pwrite(fd, header_buf, header_total_size, start_offset);
+        free(header_buf);
+    }
 
-    if (file_size > 0) fread(encrypted_data, 1, file_size, in);
-    fclose(in);
+    off_t current_offset = start_offset + header_total_size;
 
     rc4_ctx_t *rc4 = rc4_init(derived_key, key_len + 16);
-    if (file_size > 0 && rc4) rc4_crypt(rc4, encrypted_data, file_size);
-    rc4_cleanup(rc4);
     free(derived_key);
 
-    pthread_mutex_lock(write_mutex);
-    FILE *out = fopen(container_path, "ab");
-    if (out) {
-        fwrite(&header.file_size, sizeof(uint32_t), 1, out);
-        fwrite(&header.name_size, sizeof(uint32_t), 1, out);
-        fwrite(header.salt, 1, 16, out);
-        fwrite(src_file, 1, name_size, out);
-        if (file_size > 0) fwrite(encrypted_data, 1, file_size, out);
-        fclose(out);
+    unsigned char buffer[BUFFER_SIZE];
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, in)) > 0 && keep_running) {
+        if (rc4) rc4_crypt(rc4, buffer, bytes_read);
+        pwrite(fd, buffer, bytes_read, current_offset);
+        current_offset += bytes_read;
     }
-    pthread_mutex_unlock(write_mutex);
-    if (encrypted_data) free(encrypted_data);
+
+    rc4_cleanup(rc4);
+    fclose(in);
 }
 
 void* container_worker_thread(void* arg) {
@@ -163,16 +169,31 @@ void* container_worker_thread(void* arg) {
         }
         int my_index = ctx->current_index++;
         char *src_path = ctx->filenames[my_index];
+        off_t my_offset = ctx->offsets[my_index];
         pthread_mutex_unlock(&ctx->task_mutex);
-        process_container_file(src_path, ctx->container_path, ctx->master_key, &ctx->write_mutex);
+        process_container_file(src_path, ctx->fd, my_offset, ctx->master_key);
     }
     return NULL;
 }
 
 void cmd_add(const char *container, const char *master_key, char **files, int num_files) {
-    container_pool_t ctx = { files, num_files, 0, container, master_key };
+    int fd = open(container, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) return;
+
+    off_t *offsets = malloc(num_files * sizeof(off_t));
+    off_t current_offset = 0;
+
+    for (int i = 0; i < num_files; i++) {
+        offsets[i] = current_offset;
+        struct stat st;
+        if (stat(files[i], &st) == 0) {
+            uint32_t name_size = strlen(files[i]);
+            current_offset += sizeof(uint32_t) * 2 + 16 + name_size + st.st_size;
+        }
+    }
+
+    container_pool_t ctx = { files, num_files, 0, fd, offsets, master_key };
     pthread_mutex_init(&ctx.task_mutex, NULL);
-    pthread_mutex_init(&ctx.write_mutex, NULL);
 
     pthread_t workers[CONTAINER_WORKERS_COUNT];
     int active_threads = (num_files < CONTAINER_WORKERS_COUNT) ? num_files : CONTAINER_WORKERS_COUNT;
@@ -180,7 +201,8 @@ void cmd_add(const char *container, const char *master_key, char **files, int nu
     for (int i = 0; i < active_threads; i++) pthread_join(workers[i], NULL);
     
     pthread_mutex_destroy(&ctx.task_mutex);
-    pthread_mutex_destroy(&ctx.write_mutex);
+    free(offsets);
+    close(fd);
 }
 
 int compare_entries(const void *a, const void *b) {
